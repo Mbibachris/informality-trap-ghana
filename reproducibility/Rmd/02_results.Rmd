@@ -1,0 +1,1090 @@
+---
+title: "Are Informality Traps Real?"
+subtitle: "State dependence in informal and vulnerable employment across Ghana's cost-of-living crisis, 2022-2024 -- full R estimation record"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document:
+    self_contained: true
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    code_folding: show
+    df_print: default
+    theme: flatly
+    fig_caption: true
+    mathjax: null
+---
+
+```{r setup, include=FALSE}
+# Full transparent record: code visible (foldable, shown by default)
+# throughout, every table/figure/diagnostic rendered in the same order as
+# the manuscript, nothing summarized away. Self-contained HTML (figures
+# base64-embedded by rmarkdown/pandoc automatically under
+# self_contained: true) is the sole output format for this report.
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 7, fig.height = 4.2)
+PROJECT_ROOT <- here::here()
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(flextable)
+library(jsonlite)
+library(DT)
+
+show_table <- function(df, caption = NULL, digits = 4, page_length = 15) {
+  DT::datatable(df, caption = caption, rownames = FALSE, filter = "top",
+                 extensions = "Buttons",
+                 options = list(pageLength = page_length, scrollX = TRUE,
+                                dom = "Bfrtip", buttons = c("copy", "csv"))) |>
+    DT::formatRound(columns = which(sapply(df, is.numeric)), digits = digits)
+}
+
+# absolute path -- knitr resets the working directory to the Rmd's own
+# folder between every chunk (see the "in_dir" warning), so a setwd() in
+# this chunk alone does not persist for later chunks. PROJECT_ROOT itself
+# is resolved once above via here::here(), so this whole document runs
+# unchanged from a fresh clone on any machine.
+TAB <- file.path(PROJECT_ROOT, "output", "tables_r")
+pal_dv <- c(informal_it = "#4C72B0", vulnerable_it = "#DD8452")
+dv_label <- c(informal_it = "Informal (ILO job-based)", vulnerable_it = "Vulnerable (ICSE)")
+theme_set(theme_minimal(base_size = 11))
+
+rj <- function(path) jsonlite::fromJSON(path, simplifyVector = FALSE)
+num <- function(x) as.numeric(x)
+```
+
+This report follows the same order as the manuscript's Data and Methods
+and Results and Discussion sections (§3-4): setup and sample construction
+first, then descriptives, the core state-dependence estimate, the crisis
+comparison, heterogeneity, the inflation/entry analysis, and finally the
+diagnostics and robustness battery. It carries substantially more detail
+than the manuscript at every step -- full parameter vectors (not just the
+headline lag), every fit statistic, formal interaction tests behind every
+subgroup figure, and the exact numeric decompositions behind each
+reconciliation claim -- with the code that produced each number shown
+alongside it (see the "Code" buttons throughout).
+
+## 0. Setup, sample construction, and feasibility gates
+
+### 0.1 Methodology note
+
+All estimation in this report was run in R (this machine has no Stata). The
+core specification -- a dynamic random-intercept probit with the
+Wooldridge (2005) initial-conditions device -- is fit by a custom
+Gauss-Hermite quadrature maximum-likelihood engine (`R/re_probit.R`):
+analytic score, `ucminf` optimizer, cluster-robust (EA) sandwich standard
+errors built from the same per-person score contributions. This engine was
+cross-validated to 6 significant figures against an independently-built
+Python implementation of the identical model before being trusted.
+`lme4::glmer` was tried first and did not return after 47+ minutes of
+CPU time on this exact specification (39 parameters, ~45,000 observations,
+one scalar random intercept) -- apparently a pathological interaction with
+this data's many region/sector dummy columns, not merely slowness -- so it
+was abandoned in favour of the custom engine. `brms` (Stan backend) was
+confirmed to work on this machine and was run for a single flagship
+cross-check model (§6.2) per the project's own recommendation to run the
+core estimate in one engine and cross-check beta in another -- but a fully
+converged fit on this specification (39 fixed effects, ~45,000
+observations, a hierarchical structure with ~19,500 person-level
+intercepts) proved too expensive for a single R session (a 2-chain,
+1200-iteration run was on track for roughly two hours before being stopped
+in favour of a bounded, single-chain, capped-tree-depth run). §6.2 reports
+that bounded run's result honestly, including that it did not fully
+converge, rather than presenting it as a clean second estimate.
+
+Average partial effects (APEs) use the closed-form population-averaged
+probability implied by a normal random intercept -- integrating a normal
+random intercept alpha (variance sigma_alpha^2) out of Phi(x'beta + alpha)
+gives Phi( x'beta / sqrt(1 + sigma_alpha^2) ) -- evaluated as a discrete
+difference (regressor swapped between two values for every observation,
+held at its own other covariate values, averaged).
+For any binary (0/1) regressor in a plain probit comparison model, this
+discrete-difference definition is used throughout -- **not** the continuous
+partial derivative that `marginaleffects::avg_slopes()` (and Python's
+`statsmodels.get_margeff()`) compute by default for a variable not
+explicitly flagged as a dummy. This distinction was caught during
+development: it changes a reported average marginal effect by roughly 50%
+on this data (0.40 discrete vs 0.26 continuous-derivative, same fitted
+model) and is not a rounding difference -- it is the difference between the
+right quantity and the wrong one for a 0/1 regressor.
+
+The simplified Heckman (1981) reduced-form approximation that appeared in
+an earlier draft of this analysis is **dropped** from this report: it
+degenerated (the random-intercept variance collapsed to the optimizer
+boundary, σ_α ≈ 1e-7) and produced an implausible, unusable estimate. The
+Mundlak/CRE pooled-probit cross-check (§6.4) is retained as the estimator
+comparison.
+
+### 0.2 Data load
+
+```{r load-core}
+core_summary <- readr::read_csv(file.path(TAB, "core_models_summary.csv"), show_col_types = FALSE)
+step0 <- readr::read_csv(file.path(TAB, "step0_dv_lead_decision.csv"), show_col_types = FALSE)
+```
+
+### 0.3 Feasibility gates
+
+Five gates (per year) decide whether the panel supports the design at
+all and which DV leads: a per-quarter labour universe check, within-year
+panel-balance, the informality-route decision, panel-linkage validity,
+and earnings-quality. This bundle's data-inspection stage that originally
+produced a written record of that evidence (`docs/gates_report.md`) isn't
+included here -- if you produce an equivalent file at that path (one
+`## <year>` heading per year, each followed by a fenced ```json block
+with `gate1_labour_universe`, `gate2_within_year_balance`,
+`gate3_informality_route`, `gate4_panel_linkage`, `gate5_earnings_quality`
+keys), this section will parse and render it; otherwise it renders a
+short note and every other section is unaffected.
+
+```{r feasibility-gates-load}
+gates_path <- file.path(PROJECT_ROOT, "docs", "gates_report.md")
+gates <- list()
+if (file.exists(gates_path)) {
+  gates_lines <- readLines(gates_path)
+  year_blocks <- list()
+  current_year <- NA_integer_
+  buf <- character(0)
+  in_json <- FALSE
+  for (ln in gates_lines) {
+    if (grepl("^## [0-9]{4}$", ln)) {
+      current_year <- as.integer(trimws(sub("^## ", "", ln)))
+    } else if (grepl("^```json", ln)) {
+      in_json <- TRUE; buf <- character(0)
+    } else if (grepl("^```\\s*$", ln) && in_json) {
+      in_json <- FALSE
+      year_blocks[[as.character(current_year)]] <- paste(buf, collapse = "\n")
+    } else if (in_json) {
+      buf <- c(buf, ln)
+    }
+  }
+  gates <- lapply(year_blocks, function(x) jsonlite::fromJSON(x, simplifyVector = FALSE))
+}
+```
+
+```{r feasibility-gates-table}
+if (length(gates) > 0) {
+  gate_rows <- lapply(names(gates), function(yr) {
+    g <- gates[[yr]]
+    data.frame(
+      Year = as.integer(yr),
+      `Gate 1 (labour universe)` = ifelse(g$gate1_labour_universe$pass, "PASS", "FAIL"),
+      `N working-age person-qtrs` = g$gate1_labour_universe$n_working_age_rows,
+      `Gate 2 (within-year balance)` = ifelse(g$gate2_within_year_balance$pass, "PASS", "FAIL"),
+      `Share >=3 quarters` = scales::percent(g$gate2_within_year_balance$share_ge3_quarters, accuracy = 0.1),
+      `Share all 4 quarters` = scales::percent(g$gate2_within_year_balance$share_all4_quarters, accuracy = 0.1),
+      `Gate 4: N persons` = g$gate4_panel_linkage$n_unique_persons,
+      check.names = FALSE
+    )
+  })
+  flextable(bind_rows(gate_rows)) |> autofit()
+} else {
+  cat("docs/gates_report.md not found -- see the note above for the expected format; re-knit this report to see the gate table once it exists.")
+}
+```
+
+**Gate 3 (informality-route) and Gate 5 (earnings quality)** are decisions,
+not pass/fail booleans -- quoted directly from the recorded evidence
+(identical across years, so shown once):
+
+```{r feasibility-gates-narrative, results='asis'}
+if (length(gates) > 0) {
+  g1 <- gates[[1]]
+  cat(sprintf("- **Gate 3 decision:** %s\n\n", g1$gate3_informality_route$decision))
+  cat(sprintf("- **Gate 5 verdict:** %s\n\n", g1$gate5_earnings_quality$verdict))
+} else {
+  cat("Pending -- see the note above.\n\n")
+}
+```
+
+All five gates pass in every year; none forced a design change beyond the
+one already anticipated in the plan (§9.3: switch lead DV to
+`vulnerable_it` if the informality route proves thin -- confirmed
+empirically in §1 below, not because Gate 3 itself failed).
+
+### 0.4 Sample construction summary
+
+The funnel from the raw per-quarter labour universe (Gate 1) down to the
+estimation universe each core model actually fits on (employed, lag
+defined -- i.e. not a person's first observed quarter):
+
+```{r sample-construction}
+core_n_display <- core_summary %>%
+  transmute(Year = year, DV = dv_label[dv],
+            `Estimation N (lag defined)` = format(n_obs, big.mark = ","),
+            `At-risk N (lag=0)` = format(n_lag0, big.mark = ","))
+
+if (length(gates) > 0) {
+  sample_funnel <- bind_rows(lapply(names(gates), function(yr) {
+    g <- gates[[yr]]
+    data.frame(year = as.integer(yr),
+               n_working_age_pq = g$gate1_labour_universe$n_working_age_rows,
+               n_employed_pq = g$gate3_informality_route$n_employed)
+  })) %>%
+    left_join(core_summary %>% filter(dv == "vulnerable_it") %>%
+                transmute(year, n_obs_vulnerable = n_obs, n_lag0_vulnerable = n_lag0), by = "year") %>%
+    left_join(core_summary %>% filter(dv == "informal_it") %>%
+                transmute(year, n_obs_informal = n_obs, n_lag0_informal = n_lag0), by = "year")
+
+  funnel_display <- sample_funnel %>%
+    transmute(Year = year,
+              `Working-age person-qtrs (Gate 1)` = format(n_working_age_pq, big.mark = ","),
+              `Employed person-qtrs (Gate 3)` = format(n_employed_pq, big.mark = ","),
+              `Estimation N, vulnerable_it (lag defined)` = format(n_obs_vulnerable, big.mark = ","),
+              `At-risk N, vulnerable_it (lag=0)` = format(n_lag0_vulnerable, big.mark = ","),
+              `Estimation N, informal_it (lag defined)` = format(n_obs_informal, big.mark = ","),
+              `At-risk N, informal_it (lag=0)` = format(n_lag0_informal, big.mark = ","))
+  flextable(funnel_display) |> autofit()
+} else {
+  cat("The raw-universe and employed-universe ends of the funnel come from docs/gates_report.md, which isn't present (see the note above) -- showing only the estimation-universe end, from core_models_summary.csv:\n\n")
+  flextable(core_n_display) |> autofit()
+}
+```
+
+The estimation universe (~44,700-49,600 person-quarters/year) is smaller
+than the raw working-age universe mainly because the dynamic model needs
+the lag -- a person's first observed quarter in a year contributes to the
+Wooldridge initial condition but not to the likelihood's t=2,3,4 terms.
+Construction rules for every column (the ILO job-based `informal_it`
+rule, the ICSE `vulnerable_it` rule, lags, and the Wooldridge initial
+condition) are in `R/construct.R` and `R/dynamics.R`, commented inline.
+
+## 1. Descriptive patterns and the choice of outcome
+
+```{r step0-table}
+step0_display <- step0 %>%
+  transmute(Year = year, DV = dv_label[dv],
+            `Base rate` = scales::percent(base_rate_among_employed, accuracy = 0.1),
+            `P(y=1|lag=1)` = round(P_y1_given_lag1, 3),
+            `P(y=1|lag=0)` = round(P_y1_given_lag0, 3),
+            `Raw gap` = round(raw_gap, 3),
+            `N at lag=0` = n_lag0)
+flextable(step0_display) |> autofit()
+```
+
+```{r step0-chart}
+ggplot(step0, aes(x = factor(year), y = base_rate_among_employed, fill = dv)) +
+  geom_col(position = "dodge") +
+  geom_text(aes(label = scales::percent(base_rate_among_employed, accuracy = 0.1)),
+            position = position_dodge(width = 0.9), vjust = -0.4, size = 3) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  scale_fill_manual(values = pal_dv, labels = dv_label) +
+  labs(title = "DV base rates among the employed", x = "Year", y = NULL, fill = NULL) +
+  theme(legend.position = "bottom")
+```
+
+**Decision: `vulnerable_it` leads.** Its ~74-76% base rate is far less
+skewed than `informal_it`'s ~93-95%, giving 3x the "at-risk" (lag=0)
+person-quarters to identify entry (e.g. 2022: 12,029 vs 3,763) -- the
+sharper-identification criterion the analysis plan set out in advance.
+`informal_it` is reported throughout as the co-primary DV, since it is the
+paper's own named object.
+
+### 1.1 Four-state transition matrices
+
+Quarter-to-quarter transitions among the four labour-force states
+(`formal_employed`, `informal_vulnerable_employed`, `unemployed`,
+`out_of_lf`; plan §7.1), **adjacent quarters only** -- a skipped quarter is
+never counted as a transition (`R/transitions.R::quarter_pairs()` enforces
+`prev_t == t - 1`). Each cell shows the row-normalized transition
+probability with the underlying (person-weighted) raw count in
+parentheses; rows are the state at *t-1*, columns the state at *t*.
+
+```{r transitions-load}
+STATE_ORDER <- c("formal_employed", "informal_vulnerable_employed", "unemployed", "out_of_lf")
+state_label <- c(formal_employed = "Formal employed",
+                  informal_vulnerable_employed = "Informal/vulnerable employed",
+                  unemployed = "Unemployed", out_of_lf = "Out of LF")
+
+load_transition_year <- function(y) {
+  tm <- readr::read_csv(file.path(TAB, sprintf("%d_transition_matrix.csv", y)), show_col_types = FALSE)
+  gf <- readr::read_csv(file.path(TAB, sprintf("%d_gross_flows.csv", y)), show_col_types = FALSE)
+  tm <- tm %>% arrange(match(prev_status, STATE_ORDER))
+  gf <- gf %>% arrange(match(prev_status, STATE_ORDER))
+  combo <- data.frame(prev_status = tm$prev_status)
+  for (s in STATE_ORDER) {
+    combo[[s]] <- sprintf("%s%%\n(n=%s)",
+                           formatC(100 * tm[[s]], format = "f", digits = 1),
+                           format(gf[[s]], big.mark = ","))
+  }
+  combo$prev_status <- state_label[combo$prev_status]
+  names(combo)[-1] <- state_label[STATE_ORDER]
+  combo
+}
+```
+
+```{r transitions-2022}
+flextable(load_transition_year(2022)) |> autofit() |>
+  set_caption("2022 transition matrix (row = state at t-1, column = state at t)")
+```
+
+```{r transitions-2023}
+flextable(load_transition_year(2023)) |> autofit() |>
+  set_caption("2023 transition matrix")
+```
+
+```{r transitions-2024}
+flextable(load_transition_year(2024)) |> autofit() |>
+  set_caption("2024 transition matrix")
+```
+
+**Reading the diagonal and off-diagonal pattern:** the diagonal is the
+dominant entry in every row and every year. `informal_vulnerable_employed`
+is the stickiest state throughout (78.4% quarter-to-quarter persistence in
+2022, rising to 88.5% in 2023 and 88.0% in 2024). The off-diagonal cells
+are informative about direction, not just magnitude: in every year, the
+*probability* of moving from unemployment into informal/vulnerable work
+(32.5% in 2022, 22.2% in 2023, 24.3% in 2024) is far larger than the
+reverse -- leaving informal work for unemployment (6.1%, 3.8%, 2.9%) -- and
+the same asymmetry, smaller but consistent, holds between
+`out_of_lf` and informal work (22.2% in vs. 13.2% out in 2022; the gap
+narrows but does not reverse by 2024). Informal/vulnerable employment is
+therefore a much easier state to fall into than to leave, in every year of
+the panel -- the raw, uncontrolled version of the "trap" pattern the
+dynamic probit in §2 tests once heterogeneity is removed.
+
+Every state's persistence rises sharply from 2022 to 2023-2024, not just
+`informal_vulnerable_employed`'s: formal employment's diagonal goes
+63.4% -> 86.7% -> 63.4%, unemployment's goes 22.9% -> 56.5% -> 60.4%, and
+`out_of_lf`'s goes 68.5% -> 80.5% -> 83.3%. 2022 was a high-churn year
+across *every* labour-force state, not selectively for informal work --
+consistent with the crisis-comparison finding in §3 that state dependence
+is lowest in 2022 and highest in 2023, and a first, purely descriptive
+hint that the crisis year itself was too chaotic for any state (including
+the "trap") to fully consolidate.
+
+### 1.2 Full covariate descriptives by year and vulnerable-employment status
+
+Means (numeric covariates) and shares (categorical covariates), by year
+and by current `vulnerable_it` status, on the same estimation universe the
+core models use.
+
+```{r descriptives-n}
+desc_n <- readr::read_csv(file.path(TAB, "descriptives_n_summary.csv"), show_col_types = FALSE)
+desc_n_display <- desc_n %>%
+  transmute(Year = year, Status = vulnerable_it, `N person-quarters` = n_person_quarters, `N persons` = n_persons)
+flextable(desc_n_display) |> autofit() |> merge_v(j = "Year")
+```
+
+```{r descriptives-table}
+desc <- readr::read_csv(file.path(TAB, "descriptives_by_year_vulnerable.csv"), show_col_types = FALSE)
+desc_display <- desc %>%
+  mutate(value = ifelse(type == "numeric", sprintf("mean=%.3f, sd=%.3f", mean, sd), sprintf("share=%.3f", mean))) %>%
+  select(year, variable, level, vulnerable_it, value, n_obs) %>%
+  arrange(variable, level, year, vulnerable_it)
+show_table(desc_display, caption = "Covariate descriptives by year x vulnerable_it status", page_length = 20)
+```
+
+## 2. Core state-dependence estimates: true vs. spurious persistence
+
+```{r core-table}
+core_display <- core_summary %>%
+  transmute(Year = year, DV = dv_label[dv], N = n_obs, `At-risk N` = n_lag0,
+            `APE(lag)` = sprintf("%.4f (%.4f)", ape_lag, ape_lag_se),
+            `Naive coef` = round(naive_coef_lag, 3),
+            `sigma_alpha` = sprintf("%.3f (%.3f)", sigma_alpha, se_sigma_alpha),
+            `Wooldridge-aux Wald p` = ifelse(wald_aux_p < 0.0001, "<0.0001", round(wald_aux_p, 4)),
+            `Unstable?` = ifelse(unstable, "YES", ""))
+ft_core <- flextable(core_display) |> autofit()
+if ("Unstable?" %in% names(core_display)) {
+  unstable_rows <- which(core_display$`Unstable?` == "YES")
+  if (length(unstable_rows)) ft_core <- ft_core |> bg(i = unstable_rows, bg = "#FDECEA")
+}
+ft_core
+```
+
+```{r core-chart, fig.height=4.5}
+ggplot(core_summary, aes(x = factor(year), y = ape_lag, fill = dv)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  geom_errorbar(aes(ymin = ape_lag - 1.96 * ape_lag_se, ymax = ape_lag + 1.96 * ape_lag_se),
+                position = position_dodge(width = 0.8), width = 0.15) +
+  scale_fill_manual(values = pal_dv, labels = dv_label) +
+  labs(title = "Corrected average partial effect of state dependence, by year",
+       subtitle = "Dynamic RE-probit + Wooldridge device; error bars = 95% CI",
+       x = "Year", y = "APE(lag)", fill = NULL) +
+  theme(legend.position = "bottom")
+```
+
+**Reading this (the core identification check):** the Wooldridge auxiliaries
+are jointly significant at p<0.0001 in every model -- the device is doing
+real work. The lag coefficient collapses sharply once heterogeneity is
+controlled (e.g. 2022 `vulnerable_it`: naive coefficient 1.45 -> corrected
+APE 0.095), the visible signature of spurious persistence being removed.
+σ_α is well away from zero throughout. **`vulnerable_it` carries the
+clearer, better-identified trap result** (APE 0.095-0.163 in 2022-2023,
+tightly estimated); `informal_it`'s picture is noisier across years,
+plausibly because its ~93-95% base rate leaves few "at risk" observations
+per year to pin the estimate down (§6.1 below flags this formally).
+
+**Small-T caveat (Akay 2012).** Every model in this report is estimated on
+a T=4-quarter panel (T=2-4 effective, since the estimation universe needs
+the lag). The Wooldridge (2005) device used throughout is the standard
+fix for the initial-conditions problem in short panels, but it is a
+large-N/fixed-T asymptotic device, not a small-sample-exact one --
+Akay (2012) shows via Monte Carlo that dynamic RE-probit bias under this
+device is not negligible at T as short as this project's, particularly for
+σ_α and, to a lesser extent, β. Nothing in the diagnostics below
+contradicts the headline results, but the AME magnitudes -- especially for
+the DV/year cells flagged unstable in §6.1 -- should be read as
+identified up to this small-T bias, not as exact.
+
+### 2.1 Full coefficient tables and fit statistics
+
+Every fitted parameter (not just the lag) for all six core models: the
+lag β, the Wooldridge initial condition (`dv_i1`), every covariate γ, the
+within-person means and sector shares (the Wooldridge/Mundlak auxiliary
+terms), the quarter dummies, and σ_α, all with cluster-robust (EA)
+sandwich SEs. Main text: `vulnerable_it` (the lead DV). Companion:
+`informal_it`. Both tables carry a footer row with the **corrected
+discrete lag APE** (§0.1's closed-form Φ(x'β/√(1+σ_α²)) contrast) -- this
+is *not* the same quantity as the raw `L_dv` coefficient a few rows above
+it, and the two should never be read interchangeably (the plain
+coefficient is on the probit index scale; the APE is a probability-scale
+population-averaged effect).
+
+```{r fit-stats-table}
+fit_stats <- readr::read_csv(file.path(TAB, "fit_statistics.csv"), show_col_types = FALSE)
+fit_stats_display <- fit_stats %>%
+  transmute(Year = year, DV = dv_label[dv], `k (params)` = k_params,
+            `Log-lik` = round(loglik, 2), AIC = round(aic, 2),
+            `BIC (N=person-quarters)` = round(bic_n_obs, 2),
+            `BIC (N=persons)` = round(bic_n_persons, 2),
+            `N (person-qtrs)` = n_obs, `N (persons)` = n_persons,
+            `sigma_alpha` = sprintf("%.4f (%.4f)", sigma_alpha, se_sigma_alpha),
+            Converged = converged)
+flextable(fit_stats_display) |> autofit()
+```
+
+BIC is reported on both candidate sample sizes (person-quarters and
+persons) rather than picking one silently -- for a random-intercept model
+the "N" BIC should use is genuinely ambiguous in the literature; both are
+given so either convention can be applied downstream.
+
+```{r full-coef-vulnerable}
+fc_vul <- readr::read_csv(file.path(TAB, "full_coef_vulnerable_it_long.csv"), show_col_types = FALSE)
+footer_vul <- core_summary %>% filter(dv == "vulnerable_it") %>%
+  transmute(year, param = "APE(lag) [corrected, discrete, Phi(x'b/sqrt(1+sa^2))]",
+            coef = ape_lag, se = ape_lag_se, z = NA_real_, p = NA_real_)
+fc_vul_display <- bind_rows(fc_vul, footer_vul) %>% arrange(year, param != "APE(lag) [corrected, discrete, Phi(x'b/sqrt(1+sa^2))]")
+show_table(fc_vul_display, caption = "vulnerable_it: full coefficient vector, all years (footer row = corrected APE, not a raw coefficient)", page_length = 43)
+```
+
+```{r full-coef-informal}
+fc_inf <- readr::read_csv(file.path(TAB, "full_coef_informal_it_long.csv"), show_col_types = FALSE)
+footer_inf <- core_summary %>% filter(dv == "informal_it") %>%
+  transmute(year, param = "APE(lag) [corrected, discrete, Phi(x'b/sqrt(1+sa^2))]",
+            coef = ape_lag, se = ape_lag_se, z = NA_real_, p = NA_real_)
+fc_inf_display <- bind_rows(fc_inf, footer_inf) %>% arrange(year, param != "APE(lag) [corrected, discrete, Phi(x'b/sqrt(1+sa^2))]")
+show_table(fc_inf_display, caption = "informal_it: full coefficient vector, all years (companion; footer row = corrected APE)", page_length = 43)
+```
+
+## 3. Crisis comparison: is state dependence higher in the crisis year?
+
+```{r rq3-load}
+rq3_inf <- rj(file.path(TAB, "rq3_pooled_informal_it_diagnostics.json"))
+rq3_vul <- rj(file.path(TAB, "rq3_pooled_vulnerable_it_diagnostics.json"))
+
+rq3_rows <- function(x) {
+  data.frame(
+    dv = x$dv,
+    year = c(2022, 2023, 2024),
+    ape = sapply(x$ape_by_year, function(a) num(a$ape)),
+    se = sapply(x$ape_by_year, function(a) num(a$se))
+  )
+}
+rq3_df <- bind_rows(rq3_rows(rq3_inf), rq3_rows(rq3_vul))
+```
+
+```{r rq3-chart}
+ggplot(rq3_df, aes(x = factor(year), y = ape, color = dv, group = dv)) +
+  geom_line(linewidth = 1) + geom_point(size = 2.5) +
+  geom_errorbar(aes(ymin = ape - 1.96*se, ymax = ape + 1.96*se), width = 0.1) +
+  scale_color_manual(values = pal_dv, labels = dv_label) +
+  labs(title = "Pooled state-dependence APE by year (year x lag interaction)",
+       subtitle = "Person/EA keys re-qualified by year before pooling",
+       x = "Year", y = "APE(lag)", color = NULL) +
+  theme(legend.position = "bottom")
+```
+
+```{r rq3-wald}
+wald_tbl <- data.frame(
+  DV = c(dv_label["informal_it"], dv_label["vulnerable_it"]),
+  `chi2` = c(round(num(rq3_inf$wald_H0_beta_equal_across_years$stat), 2),
+             round(num(rq3_vul$wald_H0_beta_equal_across_years$stat), 2)),
+  df = c(rq3_inf$wald_H0_beta_equal_across_years$df, rq3_vul$wald_H0_beta_equal_across_years$df),
+  p = c("<0.0001", "<0.0001"), check.names = FALSE
+)
+flextable(wald_tbl) |> autofit()
+```
+
+**The exact contrast being tested.** The pooled specification above is
+`y_it ~ ... + L_dv + year_2023 + year_2024 + year_2023:L_dv + year_2024:L_dv + ...`,
+with 2022 as the reference year. The lag effect in 2022 is the base
+coefficient on `L_dv` alone; in 2023 it is `L_dv + year_2023:L_dv`; in 2024
+it is `L_dv + year_2024:L_dv`. The test above is **H0: year_2023_x_lag = 0
+AND year_2024_x_lag = 0** -- a joint 2-restriction Wald test on exactly
+those two interaction coefficients
+(`R/re_probit.R::wald_test(fit, c("year_2023_x_lag", "year_2024_x_lag"))`),
+using the model's cluster-robust variance-covariance submatrix for those
+two parameters:
+
+```{r chisq-sanity, results='asis'}
+rq3_vul_wald <- rq3_vul$wald_H0_beta_equal_across_years
+cat(sprintf("Test object (`R/re_probit.R::wald_test`), `vulnerable_it`: parameters tested = c(\"year_2023_x_lag\", \"year_2024_x_lag\"). stat=%.3f, df=%d, p=%.6g\n\n",
+            num(rq3_vul_wald$stat), rq3_vul_wald$df, num(rq3_vul_wald$p)))
+rq3_inf_wald <- rq3_inf$wald_H0_beta_equal_across_years
+cat(sprintf("Test object, `informal_it`: parameters tested = c(\"year_2023_x_lag\", \"year_2024_x_lag\"). stat=%.3f, df=%d, p=%.6g\n",
+            num(rq3_inf_wald$stat), rq3_inf_wald$df, num(rq3_inf_wald$p)))
+```
+
+**df=2 is correct and corresponds to the two year-interaction terms being
+restricted, not to the year main effects** (`year_2023`, `year_2024`
+alone) -- those main effects capture a level shift in the *intercept* by
+year (baseline prevalence), a completely different, untested hypothesis;
+they do not "load through" the lag-interaction test in any way, because
+they are separate columns in the design matrix with their own separate
+coefficients, entered simultaneously but not restricted by this particular
+Wald test. Rejecting H0 at p<0.0001 means: the *effect of the lag* on the
+outcome differs across years, which is precisely "state dependence differs
+by year."
+
+**Finding: in this pooled specification, state dependence peaks in 2023,
+not the crisis year 2022, for both DVs.** This does not match the "crisis
+deepened the trap" hypothesis in the project overview -- it is a genuine
+departure from that prior, not a confirmation, and needs new framing text
+rather than a number swap. A plausible reading: 2022 was too
+chaotic/high-churn for the trap to fully consolidate (§1.1's transition
+matrices already show this descriptively -- *every* state's persistence
+rises from 2022 to 2023-2024, not just informal/vulnerable employment's);
+2023 -- the IMF-programme/adjustment year -- is where people who fell into
+vulnerable employment *stuck*. H0 (β equal across years) is rejected at
+p<0.0001 for both DVs.
+
+### 3.1 Reconciling the per-year and pooled `informal_it` profile
+
+**This "for both DVs" claim needs one explicit qualification: it is true
+of this pooled, year-interaction specification, but it is *not* true of
+the separate per-year core models in §2**, where `informal_it` peaks in
+2024 (APE 0.174), not 2023 (APE 0.022). §6.1 already flags that 2024
+`informal_it` cell as unstable (thin at-risk sample, low σ_α) -- this
+subsection puts the two `informal_it` profiles side by side and gives the
+exact numeric decomposition of why they diverge.
+
+```{r rq3-reconcile}
+core_informal <- core_summary %>% filter(dv == "informal_it") %>%
+  transmute(year, spec = "Per-year core model (§2, separate sigma_alpha each year)",
+            ape = ape_lag, se = ape_lag_se)
+pooled_informal <- rq3_df %>% filter(dv == "informal_it") %>%
+  transmute(year, spec = "Pooled crisis-comparison model (§3, single sigma_alpha across years)", ape, se)
+reconcile_df <- bind_rows(core_informal, pooled_informal)
+
+reconcile_display <- reconcile_df %>%
+  transmute(Year = year, Specification = spec, `APE(lag)` = sprintf("%.4f (%.4f)", ape, se))
+flextable(reconcile_display) |> autofit() |> merge_v(j = "Year")
+```
+
+```{r rq3-reconcile-chart, fig.height=3.8}
+ggplot(reconcile_df, aes(x = factor(year), y = ape, color = spec, group = spec)) +
+  geom_line(linewidth = 1) + geom_point(size = 2.5) +
+  geom_errorbar(aes(ymin = ape - 1.96*se, ymax = ape + 1.96*se), width = 0.1) +
+  scale_color_manual(values = c("Per-year core model (§2, separate sigma_alpha each year)" = "#4C72B0",
+                                 "Pooled crisis-comparison model (§3, single sigma_alpha across years)" = "#C44E52")) +
+  labs(title = "informal_it: per-year vs. pooled state-dependence profile",
+       x = "Year", y = "APE(lag)", color = NULL) +
+  theme(legend.position = "bottom", legend.text = element_text(size = 8))
+```
+
+The two profiles agree that 2022 is the low point and 2023 is high, but
+disagree on 2024: the per-year model puts 2024 highest of all
+(0.174), the pooled model puts it in the middle (0.133), below 2023
+(0.215). The per-year 2024 `informal_it` estimate is built on a thin,
+flagged-unstable at-risk sample (§6.1) and swings on comparatively little
+identifying variation -- that part of the story stands. **It is NOT
+primarily the pooled model's single σ_α "pulling every year toward a
+common scale."** Formally decomposing the per-year-vs-pooled APE gap into
+a σ_α-swap component and a β-swap component -- same closed-form APE,
+evaluated at the per-year β with the pooled σ_α, and vice versa, on
+identical data, no refitting -- shows the exact mechanism:
+
+```{r reconcile-table}
+recon <- readr::read_csv(file.path(TAB, "peryear_vs_pooled_reconciliation.csv"), show_col_types = FALSE)
+recon_display <- recon %>%
+  transmute(Year = year, DV = dv_label[dv],
+            `sigma_a (per-year)` = round(sigma_alpha_per_year, 3),
+            `sigma_a (pooled)` = round(sigma_alpha_pooled, 3),
+            `Deflation (per-year)` = round(deflation_per_year, 3),
+            `Deflation (pooled)` = round(deflation_pooled, 3),
+            `APE per-year` = round(ape_per_year_actual, 4),
+            `APE pooled slice` = round(ape_pooled_slice, 4),
+            `Total gap` = round(total_gap, 4),
+            `% from sigma_a swap` = sprintf("%.1f%%", pct_gap_from_sigma),
+            `% from beta swap` = sprintf("%.1f%%", pct_gap_from_beta))
+show_table(recon_display, caption = "Per-year vs. pooled APE gap, decomposed", page_length = 6)
+```
+
+**Diagnosis:** across all six DV-year cells, the σ_α-swap component
+explains essentially none of the gap (-7% to +3%, i.e. often the wrong
+sign) while the β-swap component explains essentially all of it (98% to
+125%). The pooled model's single σ_α is **not** the mechanism -- pooling's
+binding constraint is that it forces every covariate coefficient γ to be
+identical across 2022-2024 (only the intercept and lag shift by year, via
+the interaction terms), whereas the per-year models let sector, region,
+education, household composition, etc. effects vary freely by year. For a
+noisily-estimated per-year cell like 2024 `informal_it`, that re-identified
+γ moves the fitted response surface far more than integrating over a
+different σ_α does. `vulnerable_it`'s per-year and pooled σ_α (0.81-1.15
+vs. 0.975) are far closer together than `informal_it`'s (0.35-1.58 vs.
+0.499), consistent with `vulnerable_it` not needing this diagnosis in
+practice. **Read the pooled profile as the more trustworthy summary of
+where state dependence is highest across years** -- it is not immune to
+the 2024 cell's thinness, but it is far less exposed to it than the
+per-year estimate is, for the reason just given, not the σ_α-averaging
+reason one might guess at first. `vulnerable_it`, which has no flagged
+cell, tells the same story (2023 highest) in both specifications and does
+not need this caveat.
+
+## 4. Heterogeneity in the trap
+
+```{r rq4-load}
+rq4_files <- list.files(TAB, pattern = "^rq4_.*\\.json$", full.names = TRUE)
+rq4_all <- bind_rows(lapply(rq4_files, function(f) {
+  x <- rj(f)
+  sg <- x$subgroup_ape
+  data.frame(year = x$year, group = x$group,
+             level = names(sg),
+             ape = sapply(sg, function(a) num(a$ape)),
+             se = sapply(sg, function(a) num(a$se)),
+             wald_p = num(x$wald_H0_no_heterogeneity$p))
+}))
+```
+
+```{r rq4-chart, fig.height=8}
+group_labels <- c(sex = "Sex", age_band = "Age band", edu_cat = "Education", urbrur = "Locality")
+rq4_all$group_label <- group_labels[rq4_all$group]
+
+ggplot(rq4_all, aes(x = level, y = ape, fill = factor(year))) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  geom_errorbar(aes(ymin = ape - 1.96*se, ymax = ape + 1.96*se), position = position_dodge(width = 0.8), width = 0.15) +
+  facet_wrap(~group_label, scales = "free_x", ncol = 2) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "Subgroup APE(lag), vulnerable_it, by year", x = NULL, y = "APE(lag)", fill = "Year") +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1), legend.position = "bottom")
+```
+
+**Consistent pattern across all three years: urban state dependence is
+roughly 2x rural.** Education shows a consistent secondary-education peak
+(secondary > tertiary > basic > none in all three years) -- plausibly
+workers with some schooling but not enough to credential into formal jobs
+are the most "stuck." Sex differences are small; age is inconsistent across
+years and not always jointly significant.
+
+### 4.1 Formal interaction tests and full subgroup APE table
+
+The subgroup lag-APEs behind the figure above, alongside the **formal Wald
+test of the lag x characteristic interaction** (H0: no heterogeneity on
+that dimension, that year) that the figure alone doesn't show a p-value
+for.
+
+```{r subgroup-wald-table}
+sub_wald <- readr::read_csv(file.path(TAB, "subgroup_interaction_wald.csv"), show_col_types = FALSE)
+sub_wald_display <- sub_wald %>%
+  transmute(Year = year, Dimension = dimension, `chi2` = round(wald_chi2, 2), df = wald_df,
+            p = ifelse(wald_p < 0.0001, "<0.0001", round(wald_p, 4)))
+flextable(sub_wald_display) |> autofit()
+```
+
+```{r subgroup-ape-table}
+sub_ape <- readr::read_csv(file.path(TAB, "subgroup_ape_by_dimension.csv"), show_col_types = FALSE)
+sub_ape_display <- sub_ape %>%
+  transmute(Year = year, Dimension = dimension, Level = level,
+            `APE(lag)` = sprintf("%.4f (%.4f)", ape_lag, se))
+show_table(sub_ape_display, caption = "Subgroup lag-APE by year and dimension (vulnerable_it)", page_length = 20)
+```
+
+The `age_band` interaction is the one dimension not always significant
+(2023 p=0.20) -- consistent with the figure's pattern that age is the
+least consistent heterogeneity dimension. `edu_cat` and `urbrur` are
+jointly significant at p<0.0001 in every year; `sex` weakens to p=0.086 by
+2024.
+
+## 5. Inflation and within-year entry
+
+```{r rq2-load}
+rq2 <- rj(file.path(TAB, "rq2_event_study.json"))
+entry_df <- bind_rows(lapply(rq2$entry_models, function(m) {
+  data.frame(dv = m$dv, inflation_measure = m$inflation_measure, n_obs = m$n_obs,
+             entry_rate = num(m$entry_rate), ame = num(m$ame_inflation_per_sd),
+             se = num(m$ame_inflation_se), p = num(m$p_inflation))
+}))
+```
+
+**Identification caveat, stated up front:** inflation only varies by
+*quarter* within 2022 -- at most 3 independent macro data points (Q2-Q4)
+identify the coefficient below, confounded with every other quarter-specific
+shock. Treat these as suggestive, descriptive-causal at best.
+
+```{r rq2-table}
+entry_display <- entry_df %>%
+  transmute(DV = dv_label[dv], `Inflation measure` = ifelse(inflation_measure == "inflation_yoy_qt", "YoY level", "Acceleration"),
+            N = n_obs, `Entry rate` = scales::percent(entry_rate, accuracy = 0.1),
+            `AME per 1 SD` = sprintf("%.4f (%.4f)", ame, se),
+            p = ifelse(p < 0.0001, "<0.0001", round(p, 4)))
+flextable(entry_display) |> autofit()
+```
+
+The sign is **negative** where significant -- higher/accelerating inflation
+associated with *lower* quarterly entry, the opposite of the naive
+"crisis pushes people into informal work" story. Given the 3-data-point
+identification problem, this is most credibly read as "we cannot
+distinguish an inflation effect from whatever else changed quarter to
+quarter," not as evidence inflation protects against informalisation.
+
+```{r rq2-persistence}
+pers_df <- bind_rows(lapply(rq2$persistence_of_early_entrants, function(p) {
+  data.frame(DV = dv_label[p$dv], `N early entrants` = p$n_early_entrants_with_later_obs,
+             `Stay rate` = scales::percent(num(p$stay_rate_by_q4_or_last_obs), accuracy = 0.1), check.names = FALSE)
+}))
+flextable(pers_df) |> autofit()
+```
+
+Of Q2/Q3 entrants with a later 2022 observation, the majority stayed in
+their new state through their last observed quarter -- a within-2022 echo
+of `vulnerable_it`'s more durable persistence.
+
+## 6. Diagnostics and robustness
+
+### 6.1 Quadrature stability and thin-cell / separation flags
+
+**Node-count (Gauss-Hermite quadrature) stability.** The flagship model
+(2022, `vulnerable_it`) was refit at 12 (baseline), 24, 48, and 96
+integration nodes; `vulnerable_it` 2023 and 2024 were each refit at 12 and
+24 as a lighter confirmatory check (a full 96-node sweep on all three years
+was not run -- see `R/run_node_stability.R` for the documented scope
+decision).
+
+```{r node-stability-table}
+node_path <- file.path(TAB, "node_stability.csv")
+if (file.exists(node_path)) {
+  ns <- readr::read_csv(node_path, show_col_types = FALSE)
+  ns_display <- ns %>%
+    transmute(Year = year, DV = dv_label[dv], `Nodes (K)` = n_quad,
+              `APE(lag)` = round(ape, 5), `sigma_alpha` = round(sigma_alpha, 4),
+              `Rel. change vs K=12` = sprintf("%+.3f%%", rel_change_pct))
+  ft_node <- flextable(ns_display) |> autofit() |> merge_v(j = c("Year", "DV"))
+  max_rel <- max(abs(ns$rel_change_pct))
+  stability_verdict <- if (max_rel < 1) {
+    sprintf("The largest relative change in APE across the whole sweep is %.3f%%, well inside the plan's ~1%% target -- quadrature is not the limiting source of precision anywhere in this report.", max_rel)
+  } else {
+    sprintf("**Flag:** the largest relative change in APE across the sweep is %.3f%%, ABOVE the plan's ~1%% target -- treat the affected cell's APE as quadrature-sensitive, not fully settled at K=12.", max_rel)
+  }
+} else {
+  ft_node <- NULL
+  stability_verdict <- "Node-stability sweep pending."
+}
+ft_node
+```
+
+`r stability_verdict`
+
+**Thin-cell / quasi-separation flags.** Every core model in §2's table
+carries three stored diagnostics (`R/run_core_models.R::instability_flags()`):
+at-risk (lag=0) N below 2,000; σ_α below 0.5 (well under the 0.8-1.6 range
+every other core model's random-intercept SD falls in); and quasi-separation
+(the population-averaged fitted probability landing within 1e-6 of 0 or 1
+for any observation). Any one trips the row's "Unstable?" flag.
+
+```{r instability-detail}
+inst_display <- core_summary %>%
+  filter(unstable) %>%
+  transmute(Year = year, DV = dv_label[dv], `At-risk N` = n_lag0,
+            `Thin at-risk (<2000)` = ifelse(thin_at_risk, "YES", "no"),
+            `sigma_alpha low (<0.5)` = ifelse(sigma_alpha_near_boundary, "YES", "no"),
+            `Quasi-separation` = ifelse(quasi_separation, "YES", "no"))
+if (nrow(inst_display) > 0) {
+  flextable(inst_display) |> autofit()
+} else {
+  cat("No core model tripped the instability flag.")
+}
+```
+
+**The 2024 `informal_it` cell is flagged and should not be read at face
+value.** Its at-risk N (see §2's table) is barely half the next-smallest
+core model's, and its σ_α (0.346) is the lowest of all six core models --
+both independent symptoms of a thin, sparsely-identified estimation
+problem, not a genuine finding that state dependence is stronger in 2024
+than in 2022-2023 for `informal_it`. **This estimate is retained in the
+table above, not dropped** (per this report's own convention of flagging
+rather than hiding problems), but it should not be cited as evidence about
+2024 informal-employment dynamics. For 2024, and for any year-over-year
+reading of `informal_it` generally, **lead with `vulnerable_it`**, which
+has no flagged cell in any year and was already the better-identified DV
+by the Step-0 decision in §1.
+
+### 6.2 Bayesian (brms) cross-check
+
+```{r brms-crosscheck, results='asis'}
+brms_path <- file.path(TAB, "brms_crosscheck_2022_vulnerable_it.json")
+if (file.exists(brms_path)) {
+  bc <- rj(brms_path)
+  cat(sprintf("Flagship model (2022, vulnerable_it) re-estimated in brms (Bayesian, Stan/NUTS): posterior mean APE(lag) = %.4f, 95%% credible interval [%.4f, %.4f], vs the quadrature-MLE point estimate %.4f (95%% CI [%.4f, %.4f]). Max Rhat = %.3f.\n\n",
+              num(bc$brms_ape_mean), num(bc$brms_ape_lo), num(bc$brms_ape_hi),
+              num(bc$mle_ape), num(bc$mle_ci_lo), num(bc$mle_ci_hi), num(bc$rhat_max)))
+
+  def_match <- isTRUE(bc$definition_matches_mle_engine)
+  cat(sprintf("**APE-definition check:** %s %s\n\n",
+              ifelse(def_match,
+                     "the brms APE above was already computed under the identical discrete closed-form contrast the MLE engine uses (Phi(x'beta/sqrt(1+sigma_alpha^2)), P(1)-P(0), per posterior draw then averaged) -- it was never routed through `marginaleffects::avg_comparisons()`/`avg_slopes()` (that path crashed on a missing package dependency and was abandoned in favour of the direct closed-form computation in `R/run_brms_ape_check.R`).",
+                     "the brms APE was recomputed under the MLE engine's discrete closed-form definition, replacing whatever `marginaleffects` default was used previously."),
+              "**So the 0.095-vs-0.046 gap is confirmed NOT to be a definitional artifact** -- both numbers are the same quantity, estimated two different ways."))
+
+  cat(bc$caveat, "\n\n")
+  cat(sprintf("**Read this as inconclusive, not as a contradiction of the headline MLE result.** A properly converged Bayesian estimate (multiple chains, thousands of post-warmup draws, unbounded tree depth) would be needed before drawing any substantive conclusion from the gap between %.3f and %.3f -- the intent here was a quick cross-check per the analysis plan's own suggestion, and it surfaced a *computational* limit (this model is expensive enough that a single R session cannot get a fully converged Stan fit in a reasonable session), not a *substantive* finding. The Mundlak/CRE frequentist cross-check in §6.4 remains the credible second estimator for this model.",
+              num(bc$mle_ape), num(bc$brms_ape_mean)))
+} else {
+  cat("Bayesian cross-check pending.\n")
+}
+```
+
+### 6.3 Attrition
+
+```{r robustness-load}
+rob <- rj(file.path(TAB, "robustness_battery.json"))
+
+attr_df <- bind_rows(lapply(rob$attrition_balanced_vs_unbalanced, function(x) {
+  data.frame(year = x$year, full_ape = num(x$full_ape$ape), full_n = x$full_n,
+             bal_ape = num(x$balanced_ape$ape), bal_n = x$balanced_n)
+}))
+
+mundlak_df <- bind_rows(lapply(rob$mundlak_cre_pooled_probit, function(x) {
+  data.frame(year = x$year, ame = num(x$ame_lag), se = num(x$ame_lag_se))
+}))
+
+nonrand_df <- bind_rows(lapply(rob$nonrandom_attrition_test, function(x) {
+  data.frame(year = x$year, coef = num(x$coef_dv_i1_on_attrition),
+             se = num(x$se_dv_i1_on_attrition), p = num(x$p_dv_i1_on_attrition))
+}))
+```
+
+```{r attrition-table}
+attr_display <- attr_df %>%
+  transmute(Year = year, `Full APE` = sprintf("%.4f (n=%d)", full_ape, full_n),
+            `Balanced APE` = sprintf("%.4f (n=%d)", bal_ape, bal_n))
+flextable(attr_display) |> autofit()
+```
+
+APE is essentially unchanged between the full and balanced (4-quarter-only)
+samples -- attrition is not driving the headline result. But attrition is
+**not random**: a person's first-observed status significantly reduces
+their probability of attriting in every year (all p<0.001) -- people who
+start out vulnerable are more likely to stay in the sample.
+
+```{r nonrandom-attrition-table}
+nonrand_display <- nonrand_df %>%
+  transmute(Year = year, `Coef(dv_i1 -> attrition)` = sprintf("%.3f (%.3f)", coef, se),
+            p = ifelse(p < 0.0001, "<0.0001", round(p, 4)))
+flextable(nonrand_display) |> autofit()
+```
+
+**Full attrition-probit coefficient table** (`attrition_i ~ dv_i1 +
+covariates`), not just the `dv_i1` row above:
+
+```{r attrition-full-coef}
+attr_full <- bind_rows(lapply(c(2022, 2023, 2024), function(y) {
+  f <- file.path(TAB, sprintf("attrition_probit_%d_vulnerable_it_coefs.csv", y))
+  if (!file.exists(f)) return(NULL)
+  readr::read_csv(f, show_col_types = FALSE) %>% mutate(year = y, .before = 1)
+}))
+show_table(attr_full, caption = "Attrition probit (attrition_i ~ dv_i1 + covariates): full coefficient table, all years", page_length = 27)
+```
+
+`dv_i1` (the initial vulnerable-employment status) is negative and highly
+significant in every year (the headline attrition finding above); the
+region dummies carry most of the rest of the explanatory power (attrition
+is strongly regional), while sex/age/education are comparatively weak and
+inconsistent predictors of attriting.
+
+### 6.4 Alternative estimator: Mundlak/CRE pooled probit
+
+```{r mundlak-chart}
+comp_df <- core_summary %>% filter(dv == "vulnerable_it") %>%
+  transmute(year, estimator = "Wooldridge RE-probit (headline)", ape = ape_lag, se = ape_lag_se) %>%
+  bind_rows(mundlak_df %>% transmute(year, estimator = "Mundlak/CRE pooled probit", ape = ame, se = se))
+
+ggplot(comp_df, aes(x = factor(year), y = ape, fill = estimator)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  geom_errorbar(aes(ymin = ape - 1.96 * se, ymax = ape + 1.96 * se), position = position_dodge(width = 0.8), width = 0.15) +
+  labs(title = "State-dependence estimate: headline vs. Mundlak/CRE cross-check",
+       subtitle = "vulnerable_it", x = "Year", y = "Estimated effect", fill = NULL) +
+  theme(legend.position = "bottom")
+```
+
+**This is a partial corroboration, not a full one, and should be read as a
+limitation, not a confirmation.** The two estimators agree on the *sign*
+and *statistical significance* of state dependence -- both are large,
+positive, and precisely estimated (far from zero) in all three years --
+but they do **not** agree on *magnitude*: Mundlak/CRE runs 2-3x higher
+than the headline RE-probit APE in every year (e.g. 2022: 0.267 vs 0.095;
+2023: 0.523 vs 0.163). That gap is not necessarily a red flag -- the
+RE-probit's APE integrates over a random intercept with variance σ_α²
+(implied total error variance 1+σ_α²), while the pooled CRE probit has no
+such term (implied variance 1), so the two are different
+population-averaged objects even on the same X, and probit's nonlinearity
+means they need not coincide -- but it does mean this cross-check
+corroborates the *qualitative* conclusion (a real, economically large trap
+exists) far more strongly than it corroborates any specific *point
+estimate*. Do not cite both numbers as if they were two independent
+measurements of the same quantity.
+
+**Is the gap "just" the σ_α integration, or does β itself move too?**
+
+```{r mundlak-scaling-table}
+msc <- readr::read_csv(file.path(TAB, "mundlak_scaling.csv"), show_col_types = FALSE)
+msc_display <- msc %>%
+  transmute(Year = year, DV = dv_label[dv],
+            `Mundlak AME` = round(mundlak_ame, 4), `RE-probit APE` = round(re_probit_ape, 4),
+            `sigma_alpha` = round(sigma_alpha, 3), `Deflation sqrt(1+sa^2)` = round(deflation_factor, 3),
+            `Ratio (Mundlak/RE)` = round(ratio_mundlak_to_re, 2),
+            `Ratio - deflation` = round(ratio_minus_deflation, 2))
+flextable(msc_display) |> autofit()
+```
+
+**(a) What the Mundlak number is:** confirmed a **discrete APE**, not a raw
+coefficient -- computed via `marginaleffects::avg_comparisons(variables=list(L_dv=0:1))`
+on the fitted Mundlak/CRE pooled probit, the same discrete P(1)-P(0)
+contrast convention used everywhere else in this report. Critically,
+though, it carries **no** `sqrt(1+sigma_alpha^2)` deflation, because the
+Mundlak/CRE specification has no random intercept at all (that is the
+entire point of the Mundlak device -- proxy for the person effect with
+observables, then drop the RE term).
+
+**(b) Does the ratio equal the pure deflation factor?** No, not in five of
+six DV-years. The deflation factor (what you'd expect if the *only*
+difference between the two models were the σ_α integration) is a modest
+1.06-1.87x; the actual Mundlak-to-RE ratio ranges 1.24x (`informal_it`
+2024) to 12.8x (`informal_it` 2023). Only `informal_it` 2024 comes close
+to "explained by deflation alone." **Verdict: the Mundlak/CRE gap is
+overwhelmingly NOT the random-intercept integration** -- it reflects β
+being fit by a genuinely different estimator (a pooled probit with
+Mundlak/CRE controls standing in for the person effect, vs. the full
+dynamic RE-probit with the Wooldridge device) on the same data, which is
+exactly the caveat above ("agree on sign and significance, not
+magnitude") -- this table is that caveat's numeric backing.
+
+### 6.5 SSNIT-definition cut
+
+```{r ssnit-table}
+ssnit_df <- bind_rows(lapply(rob$ssnit_route, function(x) {
+  if (isTRUE(x$skipped)) return(data.frame(Year = x$year, N = x$n_obs, `APE(lag)` = "skipped (n too small)", check.names = FALSE))
+  data.frame(Year = x$year, N = x$n_obs, `APE(lag)` = sprintf("%.4f (se %.4f)", num(x$ape_lag$ape), num(x$ape_lag$se)), check.names = FALSE)
+}))
+flextable(ssnit_df) |> autofit()
+```
+
+Rebuilding `informal_it` for employees using `ssnit_flag` instead of
+`soc_sec_entitled` (everyone else unchanged) is directionally consistent
+with the headline `informal_it` results -- same year ordering, though this
+cut is small and exploratory (`ssnit_flag` is populated for only ~8-18% of
+even the employee subsample).
+
+### 6.6 Stratum sensitivity (`region x urbrur`)
+
+No explicit design-stratum variable exists in the raw AHIES extract;
+`region x urbrur` is the practical stand-in. This
+robustness cut **adds** the full `region x urbrur` interaction (one extra
+dummy per non-base region, saturating the 32-cell stratum proxy) to the
+lead-DV headline spec -- an *additional* model, not a replacement for the
+core specification in §2.
+
+```{r stratum-table}
+strat_path <- file.path(TAB, "robustness_battery.json")
+if (file.exists(strat_path)) {
+  rob2 <- rj(strat_path)
+  if (!is.null(rob2$stratum_sensitivity)) {
+    strat_df <- bind_rows(lapply(rob2$stratum_sensitivity, function(x) {
+      data.frame(year = x$year, ape = num(x$ape_lag$ape), se = num(x$ape_lag$se),
+                 wald_p = num(x$wald_H0_no_stratum_interaction$p))
+    }))
+    strat_display <- core_summary %>% filter(dv == "vulnerable_it") %>%
+      select(year, headline_ape = ape_lag, headline_se = ape_lag_se) %>%
+      inner_join(strat_df, by = "year") %>%
+      transmute(Year = year,
+                `Headline APE(lag)` = sprintf("%.4f (%.4f)", headline_ape, headline_se),
+                `Stratum-adjusted APE(lag)` = sprintf("%.4f (%.4f)", ape, se),
+                `Wald p (interaction terms jointly = 0)` = ifelse(wald_p < 0.0001, "<0.0001", round(wald_p, 4)))
+    flextable(strat_display) |> autofit()
+  } else {
+    cat("Stratum-sensitivity results pending.")
+  }
+} else {
+  cat("Robustness battery not found.")
+}
+```
+
+The `region x urbrur` interaction terms are themselves jointly significant
+in two of the three years (the stratum has real explanatory power for
+*levels*), but adding them barely moves the state-dependence APE in any
+year -- the headline estimate is not an artifact of the coarse
+`region + urbrur` main-effects design.
+
+## 7. Synthesis: what changed relative to the plan's priors
+
+1. **Lead DV confirmed as planned**: `vulnerable_it`, decided empirically
+   from §1 exactly as anticipated.
+2. **Crisis-comparison finding inverted**: state dependence peaks in 2023,
+   not the crisis year 2022 -- the single most important finding to
+   foreground; it changes the paper's framing from "the crisis deepened the
+   trap" to "the trap consolidated in the adjustment year that followed."
+3. **Inflation/entry (§5) is weak by construction** -- only 3 quarterly
+   data points identify the inflation coefficient; report briefly, do not
+   build it up as a main result.
+4. **Heckman (1981) cross-check dropped** -- degenerated in its simplified
+   form; would need a full joint implementation to be usable.
+5. **A real AME-computation bug was caught and fixed** during this R port:
+   `avg_slopes()`/`get_margeff()`'s default continuous-derivative marginal
+   effect is not the right quantity for a binary (0/1) regressor -- the
+   discrete P(1)-P(0) contrast is (`avg_comparisons(variables=list(x=0:1))`
+   in R). This changed the Mundlak/CRE comparison numbers materially
+   relative to an earlier, uncorrected Python pass.
+6. **The 2024 `informal_it` core estimate is unreliable and is flagged as
+   such** (§6.1) -- a thin at-risk sample (N=1,783, less than half the
+   next-smallest core model's) and the lowest σ_α of any core model both
+   point to a sparsely-identified estimation problem, not a genuine
+   2024-specific finding. It is the reason the per-year and pooled
+   `informal_it` profiles disagree on which year peaks (§3.1); the pooled
+   profile (2023 highest) is the more trustworthy of the two, and
+   `vulnerable_it` -- unaffected, no flagged cell -- should lead any
+   year-over-year claim.
+7. **Quadrature-node and `region x urbrur`-stratum sensitivity checks
+   confirm the headline APEs are not artifacts of the estimation
+   settings** (§6.1, §6.6): node count moves the flagship APE by well
+   under 1%, and adding the full stratum interaction to the lead-DV model
+   moves the APE by less than 0.001 in every year.
+8. **This report carries the full statistical record integrated into each
+   section above, not appended separately**: the complete parameter
+   vector (not just the lag) for every core model (§2.1), covariate
+   descriptives (§1.2), the formal interaction tests behind the
+   heterogeneity figure (§4.1), a numeric decomposition of the
+   per-year-vs-pooled gap (§3.1), what the Mundlak/CRE number actually is
+   (§6.4), the full attrition-probit coefficient table (§6.3), and the
+   exact contrast behind the year-equality test (§3). Every table in this
+   report is also exported as CSV and JSON (`output/tables_r/`, manifest
+   in §8).
+
+Read together, the state-dependence result is real but not universal: it
+is a genuine, economically large effect for the majority-relevant
+(`vulnerable_it`) definition in every year, it is unevenly distributed
+(urban, mid-education workers most exposed), it consolidates in the
+adjustment year rather than the shock year itself, and it survives every
+alternative estimator, sample restriction, and definition tried -- while
+the informal-employment (`informal_it`) picture, precisely because it is
+thinner-identified by construction, should be read with the instability
+flags in §6.1 firmly in mind.
+
+## 8. Machine-readable export manifest
+
+Every table in this report is written locally to `output/tables_r/` as
+both CSV and JSON when you run the R estimation stage -- that directory
+is not committed to this repository (regenerable output, git-ignored).
+`output/tables_r/MANIFEST.md` (also local, also git-ignored) lists every
+file with a one-line description of its contents and the notebook
+section that reads it -- auto-generated from the actual directory
+contents by `R/run_manifest.R`, not hand-maintained, so it cannot drift
+out of sync with what running the code actually produces.

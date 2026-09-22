@@ -1,0 +1,31 @@
+# R build artifacts
+.Rproj.user/
+.Rhistory
+.RData
+renv/library/
+renv/staging/
+renv/sandbox/
+
+# Raw AHIES microdata -- not redistributed. Obtain from GSS yourself and
+# place under reproducibility/data/raw/ (see README.md).
+reproducibility/data/raw/
+
+# Every generated file -- all regenerate locally by running the pipeline
+# (see README.md's run order). Nothing here is committed.
+reproducibility/data/interim/
+reproducibility/data/processed/
+reproducibility/data/processed_r/
+reproducibility/output/
+
+# Rmd knit caches/scratch figure dirs, and rendered outputs themselves
+# (.html/.docx) -- the .Rmd source is the committed artifact; knit it
+# yourself to get the rendered report.
+reproducibility/Rmd/*_cache/
+reproducibility/Rmd/*_files/
+reproducibility/Rmd/*.html
+reproducibility/Rmd/*.docx
+
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.claude/

@@ -1,0 +1,123 @@
+---
+title: "Paper 1 -- Data Management (R pipeline)"
+subtitle: "Are informality traps real? Ghana AHIES 2022-2024"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  word_document:
+    toc: true
+    toc_depth: 2
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+PROJECT_ROOT <- here::here()
+knitr::opts_knit$set(root.dir = PROJECT_ROOT)
+setwd(PROJECT_ROOT)
+library(dplyr)
+library(ggplot2)
+library(flextable)
+source("R/pipeline.R")
+```
+
+## Purpose
+
+This document builds the analysis-ready panels from the three raw AHIES
+annual extracts (2022, 2023, 2024 -- three **independent** within-year
+panels, not a single long panel; no individual is linked across years),
+and reports the five feasibility gates that decide whether the analysis
+is informal- or vulnerable-employment-led.
+
+Every constructed column in this R pipeline was cross-validated
+column-by-column against an independent Python implementation of the
+same construction logic, for all three years, before being trusted for
+estimation (including one real discrepancy caught and fixed: pandas'
+`.transform("first")` silently skips missing values when building the
+Wooldridge initial condition, which the naive R equivalent does not
+replicate without an explicit fix -- see `R/dynamics.R::first_non_na()`).
+
+## Building the panels
+
+```{r build, cache=TRUE}
+manifest <- build_and_save_all_years()
+```
+
+```{r build-summary}
+summary_tbl <- data.frame(
+  Year = c(2022, 2023, 2024),
+  `Person-quarter rows` = sapply(c("2022","2023","2024"), function(y) manifest[[y]]$n_rows),
+  `Unique persons` = sapply(c("2022","2023","2024"), function(y) manifest[[y]]$n_persons),
+  check.names = FALSE
+)
+flextable(summary_tbl) |> autofit()
+```
+
+Pooled file: `r manifest$pooled$n_rows` person-quarter rows across all three years (`data/processed_r/pooled_person_quarter.csv`).
+
+## Feasibility gates
+
+```{r gates-table}
+gate_rows <- list()
+for (year in c(2022, 2023, 2024)) {
+  g <- manifest[[as.character(year)]]$gates
+  gate_rows[[length(gate_rows) + 1]] <- data.frame(
+    Year = year,
+    Gate = c("1. Labour universe", "2. >=3 quarters", "3. Informality route", "4. Panel linkage", "5. Earnings quality"),
+    Evidence = c(
+      sprintf("%.1f%% missing econact among working-age", 100 * g$gate1_labour_universe$overall_missing_rate),
+      sprintf("%d / %d persons (%.1f%%)", g$gate2_within_year_balance$n_persons_ge3_quarters,
+              g$gate2_within_year_balance$n_unique_persons, 100 * g$gate2_within_year_balance$share_ge3_quarters),
+      sprintf("has_contract missing %.1f%% within employees", 100 * g$gate3_informality_route$contract_missing_rate_within_employees),
+      sprintf("%.1f%% sex-constant across linked quarters", 100 * g$gate4_panel_linkage$share_multiquarter_sex_constant),
+      sprintf("%.1f%% missing among all employed; %.1f%% among employees only",
+              100 * g$gate5_earnings_quality$missing_rate_among_all_employed,
+              100 * g$gate5_earnings_quality$missing_rate_among_employees_only)
+    )
+  )
+}
+gates_tbl <- bind_rows(gate_rows)
+flextable(gates_tbl) |> autofit() |> merge_v(j = "Year")
+```
+
+**Decision (Gate 3):** `informal_it` is built from `has_contract` +
+`soc_sec_entitled` for employees, and `inst_sector` (Private Informal) +
+family-worker status for everyone else employed. `ssnit_flag` is excluded
+from the headline rule (too sparse -- see the gate-3 evidence above) and
+kept only as a robustness-only cut.
+
+## Dependent-variable base rates
+
+```{r dv-rates, fig.width=7, fig.height=4}
+rates <- list()
+for (year in c(2022, 2023, 2024)) {
+  df <- readr::read_csv(sprintf("data/processed_r/%d_person_quarter_unbalanced.csv", year), show_col_types = FALSE)
+  emp <- df %>% filter(employed_it == TRUE)
+  rates[[length(rates) + 1]] <- data.frame(
+    year = year,
+    dv = c("informal_it", "vulnerable_it"),
+    rate = c(mean(emp$informal_it, na.rm = TRUE), mean(emp$vulnerable_it, na.rm = TRUE))
+  )
+}
+rates_df <- bind_rows(rates)
+
+ggplot(rates_df, aes(x = factor(year), y = rate, fill = dv)) +
+  geom_col(position = "dodge") +
+  geom_text(aes(label = scales::percent(rate, accuracy = 0.1)), position = position_dodge(width = 0.9), vjust = -0.4, size = 3) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  scale_fill_manual(values = c("informal_it" = "#4C72B0", "vulnerable_it" = "#DD8452"),
+                     labels = c("Informal (ILO job-based)", "Vulnerable (ICSE own-account + family)")) +
+  labs(title = "Dependent-variable base rates among the employed", x = "Year", y = "Share of employed", fill = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+```
+
+`informal_it`'s ~93-95% base rate is extremely skewed; `vulnerable_it`'s
+~74-76% is far better balanced for identifying quarter-to-quarter movement
+-- the basis for the Step-0 DV-lead decision in the results report.
+
+## Known open items
+
+Known scope decisions, none of which change any reported estimate:
+no explicit design-stratum variable in the raw extract (`region x urbrur`
+used as a proxy); SSNIT-specific informality route available only as a
+robustness cut; secondary-job informality not constructed (main job only,
+standard practice in this literature).
